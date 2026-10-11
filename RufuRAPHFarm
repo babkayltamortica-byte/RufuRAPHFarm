@@ -1,0 +1,870 @@
+-- LocalScript: StarterPlayer > StarterPlayerScripts
+
+local Players = game:GetService("Players")
+local UIS = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local Debris = game:GetService("Debris")
+local player = Players.LocalPlayer
+
+local isActive, hasCandy, canCollect = false, false, false
+local currentCandy, eHolding, loading = nil, false, false
+local pickedAt = {}
+
+local dropDelay = 1.5
+local draggingSlider = false
+
+local MAX_PICK_ATTEMPTS = 2
+
+local SOUND_HOVER = "rbxassetid://139719503904449"
+local SOUND_CLICK = "rbxassetid://119354387183704"
+local SOUND_VOLUME = 3
+
+local function mk(cls, props, parent)
+	local o = Instance.new(cls)
+	for k, v in pairs(props) do o[k] = v end
+	if parent then o.Parent = parent end
+	return o
+end
+
+local function tween(obj, info, goal)
+	local t = TweenService:Create(obj, info, goal)
+	t:Play()
+	return t
+end
+
+local function playSound(id)
+	local s = Instance.new("Sound")
+	s.SoundId = id
+	s.Volume = SOUND_VOLUME
+	s.Parent = player:WaitForChild("PlayerGui")
+	s:Play()
+	Debris:AddItem(s, 3)
+end
+
+------------------------------------------------------------
+-- CANDY FOLDERS
+------------------------------------------------------------
+local function getFolders()
+	local list, seen = {}, {}
+	local function add(f)
+		if f and not seen[f] then
+			seen[f] = true
+			table.insert(list, f)
+		end
+	end
+	local ha = workspace:FindFirstChild("HalloweenArea")
+	add(ha and ha:FindFirstChild("CandySpawns"))
+	add(workspace:FindFirstChild("HalloweenCandy"))
+	add(workspace:FindFirstChild("Halloween Candy"))
+	add(workspace:FindFirstChild("CandySpawns"))
+	return list
+end
+
+local function getPad()
+	local f = workspace:FindFirstChild("CandyDropOff")
+	if f and f:FindFirstChild("Pad") then
+		return f.Pad
+	end
+
+	local ok, pad = pcall(function()
+		return workspace:WaitForChild("CandyDropOff", 5):WaitForChild("Pad", 5)
+	end)
+
+	if ok and pad then
+		return pad
+	end
+
+	return nil
+end
+
+------------------------------------------------------------
+-- FUNCTIONS
+------------------------------------------------------------
+local function getChar()
+	return player.Character or player.CharacterAdded:Wait()
+end
+
+local function teleportTo(pos)
+	local hrp = getChar():WaitForChild("HumanoidRootPart")
+	hrp.CFrame = CFrame.new(pos + Vector3.new(0, 3, 0))
+end
+
+local function isPicked(m)
+	local t = pickedAt[m]
+	if not t then return false end
+	if os.clock() - t > 25 then
+		pickedAt[m] = nil
+		return false
+	end
+	return true
+end
+
+local function isAvailable(m)
+	if not m or not m.Parent then return false end
+	if isPicked(m) then return false end
+	if m:IsA("BasePart") and m.Transparency < 0.95 then return true end
+	for _, d in pairs(m:GetDescendants()) do
+		if d:IsA("BasePart") and d.Transparency < 0.95 then return true end
+	end
+	return false
+end
+
+local function hasPrompt(m)
+	if m:IsA("ProximityPrompt") then return true end
+	for _, d in pairs(m:GetDescendants()) do
+		if d:IsA("ProximityPrompt") then return true end
+	end
+	return false
+end
+
+local function pickCandy()
+	local avail, withP = {}, {}
+	for _, f in pairs(getFolders()) do
+		for _, c in pairs(f:GetChildren()) do
+			if (c:IsA("Model") or c:IsA("BasePart")) and isAvailable(c) then
+				table.insert(avail, c)
+				if hasPrompt(c) then table.insert(withP, c) end
+			end
+		end
+	end
+	local pool = (#withP > 0) and withP or avail
+	if #pool == 0 then return nil end
+	return pool[math.random(1, #pool)]
+end
+
+local function candyPos(m)
+	if m:IsA("Model") then return m:GetPivot().Position end
+	if m:IsA("BasePart") then return m.Position end
+	return nil
+end
+
+local function promptPos(p)
+	local par = p.Parent
+	for i = 1, 2 do
+		if not par then break end
+		if par:IsA("BasePart") then return par.Position end
+		if par:IsA("Model") then return par:GetPivot().Position end
+		par = par.Parent
+	end
+	return nil
+end
+
+local function findPrompt(obj, hrp)
+	if obj:IsA("ProximityPrompt") then return obj end
+	for _, d in pairs(obj:GetDescendants()) do
+		if d:IsA("ProximityPrompt") then return d end
+	end
+	if not hrp then return nil end
+	local best, bd = nil, 30
+	for _, d in pairs(workspace:GetDescendants()) do
+		if d:IsA("ProximityPrompt") then
+			local pos = promptPos(d)
+			if pos then
+				local dist = (pos - hrp.Position).Magnitude
+				if dist < bd then best, bd = d, dist end
+			end
+		end
+	end
+	return best
+end
+
+local function holdE(prompt)
+	pcall(function()
+		prompt.Enabled = true
+		prompt.KeyCode = Enum.KeyCode.E
+		prompt.RequiresLineOfSight = false
+		prompt.MaxActivationDistance = math.max(prompt.MaxActivationDistance, 20)
+	end)
+	pcall(function() prompt:InputHoldBegin() end)
+	task.wait(math.max(prompt.HoldDuration, 0.3) + 0.2)
+	pcall(function() prompt:InputHoldEnd() end)
+end
+
+------------------------------------------------------------
+-- GUI — "Rufu Ride a Pet Halloween Farm"
+------------------------------------------------------------
+local gui = mk("ScreenGui", {
+	Name = "RufuRideAPetHalloweenFarm",
+	ResetOnSpawn = false,
+	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+	Parent = player:WaitForChild("PlayerGui")
+})
+
+local openBtn = mk("TextButton", {
+	Size = UDim2.new(0, 50, 0, 50),
+	Position = UDim2.new(0, 14, 0.5, -25),
+	BackgroundColor3 = Color3.fromRGB(30, 20, 10),
+	Text = "🎃",
+	TextSize = 26,
+	Font = Enum.Font.GothamBold,
+	TextColor3 = Color3.fromRGB(255, 165, 0),
+	Visible = false,
+	Parent = gui
+})
+mk("UICorner", {CornerRadius = UDim.new(0, 13)}, openBtn)
+mk("UIStroke", {Color = Color3.fromRGB(255, 140, 0), Thickness = 2}, openBtn)
+
+local mainFrame = mk("Frame", {
+	Size = UDim2.new(0, 340, 0, 300),
+	Position = UDim2.new(0.5, -170, 0.5, -150),
+	BackgroundColor3 = Color3.fromRGB(22, 16, 8),
+	BorderSizePixel = 0,
+	Active = true,
+	Visible = false,
+	Parent = gui
+})
+mk("UICorner", {CornerRadius = UDim.new(0, 14)}, mainFrame)
+mk("UIStroke", {Color = Color3.fromRGB(255, 140, 0), Thickness = 2, Transparency = 0.2}, mainFrame)
+local frameScale = mk("UIScale", {Scale = 0.85}, mainFrame)
+
+local titleBar = mk("Frame", {
+	Size = UDim2.new(1, 0, 0, 46),
+	BackgroundColor3 = Color3.fromRGB(45, 28, 8),
+	BorderSizePixel = 0,
+	ZIndex = 2,
+	Parent = mainFrame
+})
+mk("UICorner", {CornerRadius = UDim.new(0, 14)}, titleBar)
+mk("Frame", {
+	Size = UDim2.new(1, 0, 0, 14),
+	Position = UDim2.new(0, 0, 1, -14),
+	BackgroundColor3 = Color3.fromRGB(45, 28, 8),
+	BorderSizePixel = 0,
+	ZIndex = 2,
+	Parent = titleBar
+})
+
+local titleIcon = mk("TextLabel", {
+	Size = UDim2.new(0, 26, 0, 26),
+	Position = UDim2.new(0, 12, 0, 10),
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	BackgroundTransparency = 1,
+	Text = "🎃",
+	TextSize = 20,
+	ZIndex = 3,
+	Parent = titleBar
+})
+
+mk("TextLabel", {
+	Size = UDim2.new(1, -88, 1, 0),
+	Position = UDim2.new(0, 30, 0, 0),
+	BackgroundTransparency = 1,
+	Text = "Rufu Ride a Pet Halloween Farm",
+	TextColor3 = Color3.fromRGB(255, 180, 40),
+	TextSize = 13,
+	Font = Enum.Font.GothamBold,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	ZIndex = 3,
+	Parent = titleBar
+})
+
+local closeBtn = mk("TextButton", {
+	Size = UDim2.new(0, 30, 0, 30),
+	Position = UDim2.new(1, -38, 0, 8),
+	BackgroundColor3 = Color3.fromRGB(180, 50, 30),
+	Text = "X",
+	TextColor3 = Color3.fromRGB(255, 255, 255),
+	TextSize = 14,
+	Font = Enum.Font.GothamBold,
+	ZIndex = 3,
+	Parent = titleBar
+})
+mk("UICorner", {CornerRadius = UDim.new(0, 8)}, closeBtn)
+
+mk("Frame", {
+	Size = UDim2.new(1, -32, 0, 2),
+	Position = UDim2.new(0, 16, 0, 52),
+	BackgroundColor3 = Color3.fromRGB(255, 140, 0),
+	BorderSizePixel = 0,
+	Transparency = 0.6,
+	Parent = mainFrame
+})
+
+local warningFrame = mk("Frame", {
+	Size = UDim2.new(1, -32, 0, 40),
+	Position = UDim2.new(0, 16, 0, 60),
+	BackgroundColor3 = Color3.fromRGB(60, 35, 5),
+	BorderSizePixel = 0,
+	ZIndex = 2,
+	Parent = mainFrame
+})
+mk("UICorner", {CornerRadius = UDim.new(0, 9)}, warningFrame)
+local warnStroke = mk("UIStroke", {Color = Color3.fromRGB(255, 120, 0), Thickness = 1, Transparency = 0.4}, warningFrame)
+
+mk("TextLabel", {
+	Size = UDim2.new(1, -12, 1, 0),
+	Position = UDim2.new(0, 6, 0, 0),
+	BackgroundTransparency = 1,
+	Text = "⚠️  Get a pet first, then press START!",
+	TextColor3 = Color3.fromRGB(255, 200, 60),
+	TextSize = 12,
+	Font = Enum.Font.GothamBold,
+	TextWrapped = true,
+	TextXAlignment = Enum.TextXAlignment.Center,
+	ZIndex = 3,
+	Parent = warningFrame
+})
+
+local statusLabel = mk("TextLabel", {
+	Size = UDim2.new(1, -32, 0, 34),
+	Position = UDim2.new(0, 16, 0, 106),
+	BackgroundTransparency = 1,
+	Text = "Press START to begin the candy hunt!",
+	TextColor3 = Color3.fromRGB(230, 220, 200),
+	TextSize = 13,
+	Font = Enum.Font.Gotham,
+	TextWrapped = true,
+	TextYAlignment = Enum.TextYAlignment.Top,
+	Parent = mainFrame
+})
+
+------------------------------------------------------------
+-- DROP-DELAY SLIDER  (1.5s .. 4.0s)
+------------------------------------------------------------
+local SL_MIN, SL_MAX, TRACK_W = 1.5, 4.0, 184
+
+local sliderRow = mk("Frame", {
+	Size = UDim2.new(1, -32, 0, 26),
+	Position = UDim2.new(0, 16, 0, 146),
+	BackgroundTransparency = 1,
+	Parent = mainFrame
+})
+
+mk("TextLabel", {
+	Size = UDim2.new(0, 78, 1, 0),
+	Position = UDim2.new(0, 0, 0, 0),
+	BackgroundTransparency = 1,
+	Text = "Drop delay",
+	TextColor3 = Color3.fromRGB(230, 220, 200),
+	TextSize = 12,
+	Font = Enum.Font.GothamBold,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	Parent = sliderRow
+})
+
+local sliderTrack = mk("Frame", {
+	Size = UDim2.new(0, TRACK_W, 0, 8),
+	Position = UDim2.new(0, 84, 0.5, -4),
+	BackgroundColor3 = Color3.fromRGB(60, 40, 15),
+	BorderSizePixel = 0,
+	Active = true,
+	Parent = sliderRow
+})
+mk("UICorner", {CornerRadius = UDim.new(1, 0)}, sliderTrack)
+
+local sliderFill = mk("Frame", {
+	Size = UDim2.new(0, 0, 1, 0),
+	BackgroundColor3 = Color3.fromRGB(255, 140, 0),
+	BorderSizePixel = 0,
+	Parent = sliderTrack
+})
+mk("UICorner", {CornerRadius = UDim.new(1, 0)}, sliderFill)
+
+local sliderKnob = mk("Frame", {
+	Size = UDim2.new(0, 18, 0, 18),
+	Position = UDim2.new(0, 0, 0.5, 0),
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	BackgroundColor3 = Color3.fromRGB(255, 180, 50),
+	BorderSizePixel = 0,
+	Active = true,
+	ZIndex = 2,
+	Parent = sliderTrack
+})
+mk("UICorner", {CornerRadius = UDim.new(1, 0)}, sliderKnob)
+mk("UIStroke", {Color = Color3.fromRGB(120, 60, 0), Thickness = 1}, sliderKnob)
+
+local sliderValue = mk("TextLabel", {
+	Size = UDim2.new(0, 34, 1, 0),
+	Position = UDim2.new(0, 274, 0, 0),
+	BackgroundTransparency = 1,
+	Text = "1.5s",
+	TextColor3 = Color3.fromRGB(255, 180, 40),
+	TextSize = 12,
+	Font = Enum.Font.GothamBold,
+	TextXAlignment = Enum.TextXAlignment.Right,
+	Parent = sliderRow
+})
+
+local function setSlider(v)
+	v = math.clamp(v, SL_MIN, SL_MAX)
+	v = math.floor(v * 10 + 0.5) / 10
+	dropDelay = v
+
+	local tw = sliderTrack.AbsoluteSize.X
+	if tw <= 0 then tw = TRACK_W end
+
+	local frac = (v - SL_MIN) / (SL_MAX - SL_MIN)
+	local fp = frac * tw
+
+	sliderFill.Size = UDim2.new(0, fp, 1, 0)
+	sliderKnob.Position = UDim2.new(0, fp, 0.5, 0)
+	sliderValue.Text = string.format("%.1fs", v)
+end
+
+local function setSliderFromX(px)
+	local ap = sliderTrack.AbsolutePosition
+	local tw = sliderTrack.AbsoluteSize.X
+	if tw <= 0 then return end
+
+	local frac = (px - ap.X) / tw
+	setSlider(SL_MIN + frac * (SL_MAX - SL_MIN))
+end
+
+local function pointInSlider(px, py)
+	local ap, asz = sliderTrack.AbsolutePosition, sliderTrack.AbsoluteSize
+	return px >= ap.X - 10 and px <= ap.X + asz.X + 10
+		and py >= ap.Y - 12 and py <= ap.Y + asz.Y + 12
+end
+
+setSlider(1.5)
+
+sliderKnob.MouseEnter:Connect(function()
+	playSound(SOUND_HOVER)
+end)
+
+------------------------------------------------------------
+-- MAIN BUTTONS
+------------------------------------------------------------
+local toggleBtn = mk("TextButton", {
+	Size = UDim2.new(0, 200, 0, 46),
+	Position = UDim2.new(0.5, -100, 0, 180),
+	BackgroundColor3 = Color3.fromRGB(220, 120, 10),
+	Text = "▶  START",
+	TextColor3 = Color3.fromRGB(255, 255, 255),
+	TextSize = 18,
+	Font = Enum.Font.GothamBold,
+	Parent = mainFrame
+})
+mk("UICorner", {CornerRadius = UDim.new(0, 11)}, toggleBtn)
+local toggleStroke = mk("UIStroke", {Color = Color3.fromRGB(255, 180, 50), Thickness = 2, Transparency = 0.3}, toggleBtn)
+
+local hintLabel = mk("TextLabel", {
+	Size = UDim2.new(1, -32, 0, 30),
+	Position = UDim2.new(0, 16, 0, 232),
+	BackgroundTransparency = 1,
+	Text = "",
+	TextColor3 = Color3.fromRGB(255, 200, 80),
+	TextSize = 12,
+	Font = Enum.Font.Gotham,
+	TextWrapped = true,
+	TextYAlignment = Enum.TextYAlignment.Top,
+	Parent = mainFrame
+})
+
+mk("TextLabel", {
+	Size = UDim2.new(1, -16, 0, 18),
+	Position = UDim2.new(0, 8, 1, -26),
+	BackgroundTransparency = 1,
+	Text = "🎃 Rufu • Halloween Farm v1.5",
+	TextColor3 = Color3.fromRGB(120, 90, 50),
+	TextSize = 10,
+	Font = Enum.Font.Gotham,
+	TextXAlignment = Enum.TextXAlignment.Center,
+	Parent = mainFrame
+})
+
+------------------------------------------------------------
+-- LOADING SCREEN
+------------------------------------------------------------
+local loadGui = mk("Frame", {
+	Name = "Loading",
+	Size = UDim2.new(1, 0, 1, 0),
+	BackgroundColor3 = Color3.fromRGB(15, 10, 5),
+	BackgroundTransparency = 1,
+	Visible = false,
+	ZIndex = 10,
+	Parent = gui
+})
+
+local loadPumpkin = mk("TextLabel", {
+	Size = UDim2.new(0, 150, 0, 150),
+	Position = UDim2.new(0.5, 0, 0.5, -85),
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	BackgroundTransparency = 1,
+	Text = "🎃",
+	TextSize = 120,
+	ZIndex = 11,
+	Parent = loadGui
+})
+
+mk("TextLabel", {
+	Size = UDim2.new(0, 300, 0, 50),
+	Position = UDim2.new(0.5, 0, 0.5, 35),
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	BackgroundTransparency = 1,
+	Text = "Rufu",
+	TextColor3 = Color3.fromRGB(255, 165, 0),
+	TextSize = 44,
+	Font = Enum.Font.GothamBold,
+	ZIndex = 11,
+	Parent = loadGui
+})
+
+local barBg = mk("Frame", {
+	Size = UDim2.new(0, 260, 0, 10),
+	Position = UDim2.new(0.5, 0, 0.5, 80),
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	BackgroundColor3 = Color3.fromRGB(60, 40, 15),
+	BorderSizePixel = 0,
+	ZIndex = 11,
+	Parent = loadGui
+})
+mk("UICorner", {CornerRadius = UDim.new(1, 0)}, barBg)
+
+local barFill = mk("Frame", {
+	Size = UDim2.new(0, 0, 1, 0),
+	BackgroundColor3 = Color3.fromRGB(255, 140, 0),
+	BorderSizePixel = 0,
+	ZIndex = 12,
+	Parent = barBg
+})
+mk("UICorner", {CornerRadius = UDim.new(1, 0)}, barFill)
+
+local function showLoading(done)
+	loading = true
+
+	loadGui.Visible = true
+	loadGui.BackgroundTransparency = 1
+	loadPumpkin.Rotation = 0
+	barFill.Size = UDim2.new(0, 0, 1, 0)
+
+	tween(loadGui, TweenInfo.new(0.25), {BackgroundTransparency = 0})
+
+	local spin = tween(loadPumpkin,
+		TweenInfo.new(1.2, Enum.EasingStyle.Linear, Enum.EasingDirection.In, -1),
+		{Rotation = 360})
+
+	local fill = tween(barFill,
+		TweenInfo.new(2, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut),
+		{Size = UDim2.new(1, 0, 1, 0)})
+
+	fill.Completed:Wait()
+	spin:Cancel()
+
+	tween(loadGui, TweenInfo.new(0.3), {BackgroundTransparency = 1})
+	task.wait(0.32)
+
+	loadGui.Visible = false
+	loading = false
+
+	if done then done() end
+end
+
+------------------------------------------------------------
+-- BUTTON FX
+------------------------------------------------------------
+local function addFx(btn)
+	local sc = mk("UIScale", {Scale = 1}, btn)
+
+	btn.MouseEnter:Connect(function()
+		playSound(SOUND_HOVER)
+		tween(sc, TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Scale = 1.07})
+	end)
+
+	btn.MouseLeave:Connect(function()
+		tween(sc, TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Scale = 1})
+	end)
+
+	btn.MouseButton1Click:Connect(function()
+		playSound(SOUND_CLICK)
+		tween(sc, TweenInfo.new(0.08), {Scale = 0.93})
+		task.delay(0.09, function()
+			tween(sc, TweenInfo.new(0.14, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {Scale = 1.07})
+		end)
+	end)
+end
+
+addFx(openBtn)
+addFx(closeBtn)
+addFx(toggleBtn)
+
+------------------------------------------------------------
+-- AMBIENT ANIMATIONS
+------------------------------------------------------------
+task.spawn(function()
+	while true do
+		tween(warnStroke, TweenInfo.new(1, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), {Transparency = 0.85}).Completed:Wait()
+		tween(warnStroke, TweenInfo.new(1, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), {Transparency = 0.15}).Completed:Wait()
+	end
+end)
+
+task.spawn(function()
+	while true do
+		tween(titleIcon, TweenInfo.new(0.6, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), {Rotation = 10}).Completed:Wait()
+		tween(titleIcon, TweenInfo.new(0.6, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), {Rotation = -10}).Completed:Wait()
+	end
+end)
+
+------------------------------------------------------------
+-- WINDOW DRAG
+------------------------------------------------------------
+local dragging, dragInput, dragStart, startPos = false, nil, nil, nil
+
+titleBar.InputBegan:Connect(function(inp)
+	if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
+		dragging = true
+		dragStart = inp.Position
+		startPos = mainFrame.Position
+	end
+end)
+
+titleBar.InputChanged:Connect(function(inp)
+	if inp.UserInputType == Enum.UserInputType.MouseMovement or inp.UserInputType == Enum.UserInputType.Touch then
+		dragInput = inp
+	end
+end)
+
+------------------------------------------------------------
+-- SLIDER DRAG
+------------------------------------------------------------
+local function tryBeginSlider(inp)
+	if loading or draggingSlider or not mainFrame.Visible then return end
+
+	if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
+		if not pointInSlider(inp.Position.X, inp.Position.Y) then return end
+
+		draggingSlider = true
+		playSound(SOUND_CLICK)
+		setSliderFromX(inp.Position.X)
+	end
+end
+
+sliderTrack.InputBegan:Connect(tryBeginSlider)
+sliderKnob.InputBegan:Connect(tryBeginSlider)
+
+------------------------------------------------------------
+-- INPUT HANDLER
+------------------------------------------------------------
+UIS.InputBegan:Connect(function(inp, processed)
+	if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
+		tryBeginSlider(inp)
+	end
+
+	if processed then return end
+
+	if inp.KeyCode == Enum.KeyCode.E then
+		eHolding = true
+		if isActive and canCollect and not hasCandy then
+			task.spawn(function()
+				task.wait(0.3)
+				if eHolding and isActive and canCollect and not hasCandy then
+					collectCandy()
+				end
+			end)
+		end
+	end
+end)
+
+UIS.InputChanged:Connect(function(inp)
+	if dragging and inp == dragInput then
+		local d = inp.Position - dragStart
+		mainFrame.Position = UDim2.new(
+			startPos.X.Scale,
+			startPos.X.Offset + d.X,
+			startPos.Y.Scale,
+			startPos.Y.Offset + d.Y
+		)
+	end
+
+	if draggingSlider and not loading and mainFrame.Visible then
+		if inp.UserInputType == Enum.UserInputType.MouseMovement or inp.UserInputType == Enum.UserInputType.Touch then
+			setSliderFromX(inp.Position.X)
+		end
+	end
+end)
+
+UIS.InputEnded:Connect(function(inp)
+	if inp.KeyCode == Enum.KeyCode.E then
+		eHolding = false
+	end
+
+	if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
+		dragging = false
+		draggingSlider = false
+	end
+end)
+
+------------------------------------------------------------
+-- OPEN / CLOSE
+------------------------------------------------------------
+closeBtn.MouseButton1Click:Connect(function()
+	local t = tween(frameScale, TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {Scale = 0.85})
+	t.Completed:Wait()
+	mainFrame.Visible = false
+	openBtn.Visible = true
+end)
+
+openBtn.MouseButton1Click:Connect(function()
+	mainFrame.Visible = true
+	openBtn.Visible = false
+	frameScale.Scale = 0.85
+	tween(frameScale, TweenInfo.new(0.35, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {Scale = 1})
+end)
+
+------------------------------------------------------------
+-- CORE LOGIC
+------------------------------------------------------------
+local teleportToNextCandy
+local collectCandy
+
+collectCandy = function()
+	if not canCollect or hasCandy or not currentCandy then return end
+	canCollect, hasCandy = false, true
+
+	local char = getChar()
+	local hrp = char:FindFirstChild("HumanoidRootPart")
+	if not hrp then
+		hasCandy = false
+		return
+	end
+
+	local collected = false
+
+	for attempt = 1, MAX_PICK_ATTEMPTS do
+		if attempt == 1 then
+			statusLabel.Text = "🍬 Holding E to take candy..."
+		else
+			statusLabel.Text = "🔁 Candy is still there — trying again..."
+		end
+
+		local prompt = findPrompt(currentCandy, hrp)
+		if prompt then
+			holdE(prompt)
+			task.wait(0.25)
+
+			if not isAvailable(currentCandy) then
+				collected = true
+				break
+			end
+		else
+			break
+		end
+	end
+
+	if currentCandy then
+		pickedAt[currentCandy] = os.clock()
+	end
+
+	if not collected then
+		statusLabel.Text = "⚠️ Could not take this candy, searching another..."
+		hintLabel.Text = ""
+		hasCandy = false
+		task.wait(0.35)
+
+		if isActive then
+			teleportToNextCandy()
+		end
+		return
+	end
+
+	statusLabel.Text = string.format("🍬 Collected! Teleporting to Pad in %.1fs...", dropDelay)
+	hintLabel.Text = ""
+
+	task.wait(dropDelay)
+	if not isActive then return end
+
+	local pad = getPad()
+	if not pad then
+		statusLabel.Text = "❌ CandyDropOff Pad not found!"
+		hintLabel.Text = "Check workspace > CandyDropOff > Pad"
+		hasCandy = false
+		task.wait(0.6)
+
+		if isActive then
+			teleportToNextCandy()
+		end
+		return
+	end
+
+	teleportTo(pad.Position)
+	task.wait(0.4)
+
+	hrp = getChar():FindFirstChild("HumanoidRootPart")
+	local padPrompt = findPrompt(pad, hrp)
+	if padPrompt then
+		statusLabel.Text = "📦 Holding E on Pad — delivering candy..."
+		holdE(padPrompt)
+	end
+
+	task.wait(0.4)
+	if not isActive then return end
+
+	statusLabel.Text = "🎉 Cycle complete! Scanning for more candy..."
+	hasCandy = false
+	task.wait(0.6)
+	teleportToNextCandy()
+end
+
+teleportToNextCandy = function()
+	if not isActive then return end
+
+	currentCandy = nil
+
+	for attempt = 1, 10 do
+		local cand = pickCandy()
+		if not cand then break end
+
+		local pos = candyPos(cand)
+		if pos and isAvailable(cand) then
+			currentCandy = cand
+			teleportTo(pos)
+
+			if isAvailable(currentCandy) then
+				break
+			end
+
+			currentCandy = nil
+		end
+	end
+
+	if not currentCandy then
+		statusLabel.Text = "😢 No visible candy found!"
+		hintLabel.Text = "Will re-check after next activation."
+		canCollect = false
+		return
+	end
+
+	canCollect = true
+	statusLabel.Text = "🎃 Candy located! Holding E to grab..."
+	hintLabel.Text = "Sit back — everything is automatic."
+
+	task.spawn(function()
+		task.wait(0.4)
+		if isActive and canCollect and not hasCandy then
+			collectCandy()
+		end
+	end)
+end
+
+toggleBtn.MouseButton1Click:Connect(function()
+	if loading then return end
+
+	isActive = not isActive
+
+	if isActive then
+		toggleBtn.Text = "⏹  STOP"
+		toggleBtn.BackgroundColor3 = Color3.fromRGB(200, 50, 30)
+		toggleStroke.Color = Color3.fromRGB(255, 80, 50)
+		pickedAt = {}
+		statusLabel.Text = "🚀 Hunt started! Scanning for candy..."
+		task.wait(0.2)
+		teleportToNextCandy()
+	else
+		toggleBtn.Text = "▶  START"
+		toggleBtn.BackgroundColor3 = Color3.fromRGB(220, 120, 10)
+		toggleStroke.Color = Color3.fromRGB(255, 180, 50)
+		canCollect, hasCandy, currentCandy = false, false, nil
+		statusLabel.Text = "Press START to begin the candy hunt!"
+		hintLabel.Text = ""
+	end
+end)
+
+------------------------------------------------------------
+-- STARTUP LOADING
+------------------------------------------------------------
+task.spawn(function()
+	showLoading(function()
+		mainFrame.Visible = true
+		tween(frameScale, TweenInfo.new(0.4, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {Scale = 1})
+	end)
+end)
